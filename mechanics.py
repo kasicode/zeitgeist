@@ -75,7 +75,9 @@ def _get_client():
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set.")
-    return Anthropic(api_key=api_key)
+    # Explicit timeout so a network hiccup fails a run (visibly, in minutes)
+    # instead of leaving it hung on "processing" indefinitely.
+    return Anthropic(api_key=api_key, timeout=120.0)
 
 
 def _extract_json_array(text):

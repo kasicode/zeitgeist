@@ -111,29 +111,30 @@ def parse_tubular_csv(file_bytes):
 
 
 def upsert_videos(conn, rows, run_id):
-    """Insert new videos, update stats on ones we've seen before."""
-    now = datetime.utcnow().isoformat()
-    n_new = 0
-    for r in rows:
-        existing = conn.execute("SELECT url FROM videos WHERE url=?", (r["url"],)).fetchone()
-        if existing:
-            conn.execute(
-                """UPDATE videos SET views=?, engagements=?, last_seen_run=?
-                   WHERE url=?""",
-                (r["views"], r["engagements"], run_id, r["url"]),
-            )
-        else:
-            n_new += 1
-            conn.execute(
-                """INSERT INTO videos
-                   (url, platform, title, creator, followers, genre, views, engagements,
-                    published_at, duration, sound_title, first_seen_run, last_seen_run)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (r["url"], r["platform"], r["title"], r["creator"], r["followers"], r["genre"],
-                 r["views"], r["engagements"], r["published_at"], r["duration"], r["sound_title"],
-                 run_id, run_id),
-            )
-    return n_new
+    """Insert new videos, update stats on ones we've seen before.
+
+    Batched as a single executemany() with an ON CONFLICT upsert rather than
+    a per-row SELECT-then-INSERT/UPDATE loop. The per-row version does two
+    round trips per video (40,000+ for a 20k-row export) against the Railway
+    volume, which is network-attached storage - that's the difference
+    between this finishing in seconds versus effectively hanging for hours.
+    """
+    before = conn.execute("SELECT COUNT(*) c FROM videos").fetchone()["c"]
+    conn.executemany(
+        """INSERT INTO videos
+           (url, platform, title, creator, followers, genre, views, engagements,
+            published_at, duration, sound_title, first_seen_run, last_seen_run)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(url) DO UPDATE SET
+             views=excluded.views,
+             engagements=excluded.engagements,
+             last_seen_run=excluded.last_seen_run""",
+        [(r["url"], r["platform"], r["title"], r["creator"], r["followers"], r["genre"],
+          r["views"], r["engagements"], r["published_at"], r["duration"], r["sound_title"],
+          run_id, run_id) for r in rows],
+    )
+    after = conn.execute("SELECT COUNT(*) c FROM videos").fetchone()["c"]
+    return after - before
 
 
 def _median(values):
@@ -207,12 +208,12 @@ def score_trailing_window(conn, report_date, window_days=TRAILING_WINDOW_DAYS):
         v["outlier_score"] = sum(parts) / len(parts) if parts else None
 
     # Persist scores for anything scored this run (keeps /run/<id> and the
-    # dashboard's video table showing current numbers).
-    for v in videos:
-        conn.execute(
-            "UPDATE videos SET breakout_ratio=?, vs_own_median=?, vs_genre_median=?, outlier_score=? WHERE url=?",
-            (v["breakout_ratio"], v["vs_own_median"], v["vs_genre_median"], v["outlier_score"], v["url"]),
-        )
+    # dashboard's video table showing current numbers). Batched - see the
+    # note in upsert_videos about why a per-row loop is the wrong call here.
+    conn.executemany(
+        "UPDATE videos SET breakout_ratio=?, vs_own_median=?, vs_genre_median=?, outlier_score=? WHERE url=?",
+        [(v["breakout_ratio"], v["vs_own_median"], v["vs_genre_median"], v["outlier_score"], v["url"]) for v in videos],
+    )
 
     scored = [v for v in videos if v["outlier_score"] is not None and (v["views"] or 0) >= MIN_VIEWS_FLOOR]
     scored.sort(key=lambda v: v["outlier_score"], reverse=True)

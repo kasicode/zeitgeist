@@ -103,7 +103,10 @@ def upload():
         try:
             pipeline.run_pipeline(file_bytes, filename)
         except Exception:
-            pass  # already recorded on the run row
+            # pipeline.run_pipeline already recorded status='error' on the
+            # run row and printed the traceback to stderr - nothing further
+            # to do here, just don't let it kill the background thread silently.
+            pass
 
     threading.Thread(target=_run, daemon=True).start()
     return redirect(url_for("runs"))
